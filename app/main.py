@@ -1,15 +1,23 @@
+import os
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 import base64
 import logging
 import sqlite3
 import tempfile
 import threading
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from .auth import create_session, require_admin
 from .config import settings
@@ -21,10 +29,10 @@ from .normalization import is_plausible_nigerian_plate, normalize_plate_text
 from .ocr import OCRReader
 from .pipeline import VNPRPipeline
 from .segmentation.character_segmentation import segment_plate_characters
-from .traffic import CameraRuleConfig, TrafficStore, TrafficViolationMonitor
+from .traffic import CameraRuleConfig, TrafficStore, TrafficViolationMonitor, normalize_traffic_light_state
+from .traffic_light_detector import TrafficLightDetector
 from .vehicle_classifier import VehicleClassifier
 
-app = FastAPI(title="Nigerian VNPR API", version="1.0.0")
 logger = logging.getLogger(__name__)
 history = HistoryStore(settings.database_path)
 persistent_vehicles = PersistentVehicleStore(settings.database_path)
@@ -34,7 +42,10 @@ vehicle_status = VehicleStatusStore(settings.database_path)
 vehicle_obligations = VehicleObligationStore(settings.database_path)
 vehicle_alerts = VehicleAlertStore(settings.database_path)
 traffic_store = TrafficStore(settings.database_path, settings.traffic_evidence_path)
-traffic_config = CameraRuleConfig.from_dict(traffic_store.get_camera("CAM-01") or {"camera_id": "CAM-01"})
+traffic_config = CameraRuleConfig.from_dict({
+    **(traffic_store.get_camera("CAM-01") or {"camera_id": "CAM-01"}),
+    "citation_amounts": {"RED_LIGHT": float(settings.red_light_fine)},
+})
 traffic_monitor = TrafficViolationMonitor(
     traffic_store,
     traffic_config,
@@ -44,6 +55,22 @@ traffic_monitor = TrafficViolationMonitor(
     cooldown=settings.traffic_alert_cooldown,
 )
 pipeline = VNPRPipeline(plate_registry=registry)
+
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    model_path = settings.model_path
+    model_exists = model_path.is_file()
+    model_size = model_path.stat().st_size if model_exists else None
+    logger.info("plate_model_path=%s exists=%s size_bytes=%s", model_path, model_exists, model_size)
+    if model_size is not None and model_size < 1024:
+        logger.warning("Plate model is under 1 KiB and may be a Git LFS pointer: %s", model_path)
+    application.state.yolo_model = pipeline.detector._load()
+    log_phase(logger, "plate_model_loaded", size_bytes=model_size)
+    yield
+
+
+app = FastAPI(title="Nigerian VNPR API", version="1.0.0", lifespan=lifespan)
 
 
 def _status_payload(plate_text: str | None) -> dict[str, object]:
@@ -101,6 +128,17 @@ class LiveCameraManager:
         self._ocr = OCRReader(settings.ocr_languages, settings.ocr_gpu)
         self._vehicle_classifier = VehicleClassifier(settings.vehicle_model_path)
         self._tracker = LiveVehicleTracker(ocr_interval=settings.ocr_interval, track_timeout=settings.track_timeout)
+        self._traffic_light_detector = TrafficLightDetector(
+            roi=self._traffic_monitor.config.traffic_light_roi,
+            min_confidence=self._traffic_monitor.config.traffic_light_min_confidence,
+            stable_frames=self._traffic_monitor.config.traffic_light_stable_frames,
+        )
+
+    def _refresh_traffic_light_detector(self) -> None:
+        config = self._traffic_monitor.config
+        self._traffic_light_detector.set_roi(config.traffic_light_roi)
+        self._traffic_light_detector.min_confidence = max(0.0, min(1.0, float(config.traffic_light_min_confidence)))
+        self._traffic_light_detector.stable_frames = max(1, int(config.traffic_light_stable_frames))
 
     @property
     def running(self) -> bool:
@@ -330,6 +368,22 @@ class LiveCameraManager:
         if frame is None or frame.size == 0:
             return frame
 
+        self._refresh_traffic_light_detector()
+        config = self._traffic_monitor.config
+        effective_state = "UNKNOWN"
+        if config.traffic_light_enabled:
+            if str(config.traffic_light_mode or "MANUAL").upper() == "AUTO":
+                detected_state, _, _ = self._traffic_light_detector.detect(frame)
+                effective_state = normalize_traffic_light_state(detected_state)
+                config.traffic_light_state = effective_state
+                if config.traffic_light_debug_overlay:
+                    frame = self._traffic_light_detector.render_overlay(frame, effective_state)
+            else:
+                effective_state = normalize_traffic_light_state(config.traffic_light_state) if config.traffic_light_state is not None else "UNKNOWN"
+                config.traffic_light_state = effective_state
+                if config.traffic_light_debug_overlay:
+                    frame = self._traffic_light_detector.render_overlay(frame, effective_state)
+
         height, width = frame.shape[:2]
         max_dimension = max(width, height)
         scale = 1.0
@@ -407,6 +461,7 @@ class LiveCameraManager:
                                 state.vehicle_make = registration.get("vehicle_make")
                                 state.registration_count = int(registration["recognition_count"])
 
+            self._traffic_monitor.config.traffic_light_state = effective_state
             self._traffic_monitor.observe(
                 state.track_id,
                 (x1, y1, x2, y2),
@@ -457,7 +512,7 @@ class LiveCameraManager:
 
 
 live_camera = LiveCameraManager()
-mobile_traffic_config = CameraRuleConfig.from_dict({**traffic_config.__dict__, "camera_id": "MOBILE-01", "camera_name": "Mobile browser"})
+mobile_traffic_config = CameraRuleConfig.from_dict({**traffic_config.__dict__, "camera_id": "MOBILE-01", "camera_name": "Mobile browser", "citation_amounts": {"RED_LIGHT": float(settings.red_light_fine)}})
 mobile_traffic_monitor = TrafficViolationMonitor(
     traffic_store,
     mobile_traffic_config,
@@ -524,7 +579,15 @@ async def recognize(request: Request, file: UploadFile = File(...), debug: bool 
     try:
         image = _decode_image(payload)
         log_phase(logger, "image_decoded", width=int(image.shape[1]), height=int(image.shape[0]))
-        results = pipeline.recognize(image, debug=debug)
+        height, width = image.shape[:2]
+        longest_side = max(width, height)
+        coordinate_scale = 1.0
+        if longest_side > 1280:
+            scale = 1280 / longest_side
+            coordinate_scale = 1.0 / scale
+            resized_dimensions = (max(1, round(width * scale)), max(1, round(height * scale)))
+            image = cv2.resize(image, resized_dimensions, interpolation=cv2.INTER_AREA)
+        results = await run_in_threadpool(pipeline.recognize, image, debug=debug)
         valid_results = [
             result
             for result in results
@@ -538,6 +601,19 @@ async def recognize(request: Request, file: UploadFile = File(...), debug: bool 
             "results": [
                 {
                     **result.to_dict(),
+                    "bbox": {
+                        "x1": round(result.bbox.x1 * coordinate_scale),
+                        "y1": round(result.bbox.y1 * coordinate_scale),
+                        "x2": round(result.bbox.x2 * coordinate_scale),
+                        "y2": round(result.bbox.y2 * coordinate_scale),
+                    },
+                    "xyxy": [
+                        round(result.bbox.x1 * coordinate_scale),
+                        round(result.bbox.y1 * coordinate_scale),
+                        round(result.bbox.x2 * coordinate_scale),
+                        round(result.bbox.y2 * coordinate_scale),
+                    ],
+                    "confidence": result.detection_confidence,
                     **_status_payload(result.text),
                     **(
                         {
@@ -837,7 +913,7 @@ async def create_traffic_camera(request: Request) -> dict[str, object]:
         config = CameraRuleConfig.from_dict(data)
         traffic_config = config
         traffic_monitor.config = config
-        mobile_traffic_config = CameraRuleConfig.from_dict({**config.__dict__, "camera_id": "MOBILE-01", "camera_name": "Mobile browser"})
+        mobile_traffic_config = CameraRuleConfig.from_dict({**config.__dict__, "camera_id": "MOBILE-01", "camera_name": "Mobile browser", "citation_amounts": {"RED_LIGHT": float(settings.red_light_fine)}})
         mobile_camera._traffic_monitor.config = mobile_traffic_config
         return traffic_store.save_camera(config, str(data.get("camera_source") or ""))
     except (TypeError, ValueError) as exc:
@@ -852,7 +928,7 @@ async def update_traffic_camera(camera_id: str, request: Request) -> dict[str, o
     try:
         traffic_config = CameraRuleConfig.from_dict(data)
         traffic_monitor.config = traffic_config
-        mobile_traffic_config = CameraRuleConfig.from_dict({**traffic_config.__dict__, "camera_id": "MOBILE-01", "camera_name": "Mobile browser"})
+        mobile_traffic_config = CameraRuleConfig.from_dict({**traffic_config.__dict__, "camera_id": "MOBILE-01", "camera_name": "Mobile browser", "citation_amounts": {"RED_LIGHT": float(settings.red_light_fine)}})
         mobile_camera._traffic_monitor.config = mobile_traffic_config
         return traffic_store.save_camera(traffic_config, str(data.get("camera_source") or ""))
     except (TypeError, ValueError) as exc:
