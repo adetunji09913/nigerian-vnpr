@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 
@@ -16,15 +16,16 @@ def _resolve_path(raw_path: str | None, fallback: Path) -> Path:
 
 
 def _default_plate_model_path() -> Path:
+    app_dir = os.path.dirname(__file__)
     candidates = [
-        PROJECT_ROOT / "runs" / "detect" / "runs" / "detect" / "nigerian_license_plate-4" / "weights" / "best.pt",
-        PROJECT_ROOT / "runs" / "detect" / "nigerian_license_plate-4" / "weights" / "best.pt",
-        PROJECT_ROOT / "models" / "license_plate.pt",
+        Path(os.path.join(app_dir, os.pardir, "runs", "detect", "runs", "detect", "nigerian_license_plate-4", "weights", "best.pt")),
+        Path(os.path.join(app_dir, os.pardir, "runs", "detect", "nigerian_license_plate-4", "weights", "best.pt")),
+        Path(os.path.join(app_dir, os.pardir, "models", "license_plate.pt")),
     ]
     for candidate in candidates:
         if candidate.exists():
             return candidate.resolve()
-    return (PROJECT_ROOT / "runs" / "detect" / "runs" / "detect" / "nigerian_license_plate-4" / "weights" / "best.pt").resolve()
+    return candidates[-1].resolve()
 
 
 def _database_path() -> Path:
@@ -39,6 +40,8 @@ def _database_path() -> Path:
 
 def _vehicle_model_path() -> Path | None:
     configured_path = os.getenv("VEHICLE_MODEL_PATH")
+    if configured_path and configured_path.strip().lower() == "none":
+        return None
     if configured_path:
         candidate = Path(configured_path)
         if not candidate.is_absolute():
@@ -80,6 +83,18 @@ class Settings:
     traffic_confidence_threshold: float = float(os.getenv("TRAFFIC_CONFIDENCE_THRESHOLD", "0.55"))
     traffic_ocr_threshold: float = float(os.getenv("TRAFFIC_OCR_THRESHOLD", "0.55"))
     traffic_alert_cooldown: float = float(os.getenv("TRAFFIC_ALERT_COOLDOWN", "30"))
+    red_light_fine: int = int(os.getenv("RED_LIGHT_FINE", "50000"))
+    traffic_light_mode: str = os.getenv("TRAFFIC_LIGHT_MODE", "MANUAL").upper()
+    traffic_light_roi: dict[str, int] = field(default_factory=lambda: {
+        "x1": int(os.getenv("TRAFFIC_LIGHT_ROI_X1", "0")),
+        "y1": int(os.getenv("TRAFFIC_LIGHT_ROI_Y1", "0")),
+        "x2": int(os.getenv("TRAFFIC_LIGHT_ROI_X2", "0")),
+        "y2": int(os.getenv("TRAFFIC_LIGHT_ROI_Y2", "0")),
+    })
+    traffic_light_min_confidence: float = float(os.getenv("TRAFFIC_LIGHT_MIN_CONFIDENCE", "0.60"))
+    traffic_light_stable_frames: int = int(os.getenv("TRAFFIC_LIGHT_STABLE_FRAMES", "4"))
+    traffic_light_debug_overlay: bool = os.getenv("TRAFFIC_LIGHT_DEBUG_OVERLAY", "true").lower() == "true"
+    traffic_test_mode: bool = os.getenv("TRAFFIC_TEST_MODE", "false").lower() == "true"
     auth_secret: str = os.getenv("AUTH_SECRET", "change-this-development-secret")
     session_days: int = int(os.getenv("SESSION_DAYS", "7"))
 
