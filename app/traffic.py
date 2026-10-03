@@ -23,6 +23,25 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def normalize_traffic_light_state(value: Any) -> str:
+    normalized = str(value or "").strip().upper()
+    aliases = {
+        "AMBER": "YELLOW",
+        "Y": "YELLOW",
+        "YELLOW": "YELLOW",
+        "RED": "RED",
+        "GREEN": "GREEN",
+        "UNKNOWN": "UNKNOWN",
+        "UNAVAILABLE": "UNKNOWN",
+        "N/A": "UNKNOWN",
+        "NULL": "UNKNOWN",
+        "NONE": "UNKNOWN",
+    }
+    if normalized in aliases:
+        return aliases[normalized]
+    return "UNKNOWN"
+
+
 def _point(value: Iterable[float]) -> tuple[float, float]:
     values = list(value)
     if len(values) != 2:
@@ -70,7 +89,12 @@ class CameraRuleConfig:
     speed_limit: float | None = None
     speed_tolerance: float = 5.0
     traffic_light_enabled: bool = False
+    traffic_light_mode: str = "MANUAL"
     traffic_light_state: str | None = None
+    traffic_light_roi: dict[str, int] = field(default_factory=lambda: {"x1": 0, "y1": 0, "x2": 0, "y2": 0})
+    traffic_light_min_confidence: float = 0.60
+    traffic_light_stable_frames: int = 4
+    traffic_light_debug_overlay: bool = True
     stop_line: list[tuple[float, float]] = field(default_factory=list)
     bus_lane_enabled: bool = False
     bus_lane_polygon: list[tuple[float, float]] = field(default_factory=list)
@@ -91,6 +115,23 @@ class CameraRuleConfig:
         def polygon(value: Any) -> list[tuple[float, float]]:
             return [_point(item) for item in (value or [])]
 
+        def normalized_roi(value: Any) -> dict[str, int]:
+            if isinstance(value, dict):
+                item = value.copy()
+                return {
+                    "x1": int(item.get("x1", 0)),
+                    "y1": int(item.get("y1", 0)),
+                    "x2": int(item.get("x2", 0)),
+                    "y2": int(item.get("y2", 0)),
+                }
+            if isinstance(value, (list, tuple)) and len(value) >= 4:
+                x1, y1, x2, y2 = value[:4]
+                return {"x1": int(x1), "y1": int(y1), "x2": int(x2), "y2": int(y2)}
+            return {"x1": 0, "y1": 0, "x2": 0, "y2": 0}
+
+        citation_amounts = {str(key): float(value) for key, value in (data.get("citation_amounts") or {}).items()}
+        if "RED_LIGHT" not in citation_amounts:
+            citation_amounts["RED_LIGHT"] = 50000.0
         return cls(
             camera_id=str(data.get("camera_id") or "CAM-01"),
             camera_name=str(data.get("camera_name") or "Camera 01"),
@@ -99,7 +140,12 @@ class CameraRuleConfig:
             speed_limit=float(data["speed_limit"]) if data.get("speed_limit") is not None else None,
             speed_tolerance=float(data.get("speed_tolerance", 5.0)),
             traffic_light_enabled=bool(data.get("traffic_light_enabled", False)),
-            traffic_light_state=str(data.get("traffic_light_state") or "").upper() or None,
+            traffic_light_mode=str(data.get("traffic_light_mode", "MANUAL")).upper(),
+            traffic_light_state=normalize_traffic_light_state(data.get("traffic_light_state")) if data.get("traffic_light_state") is not None else None,
+            traffic_light_roi=normalized_roi(data.get("traffic_light_roi")),
+            traffic_light_min_confidence=float(data.get("traffic_light_min_confidence", 0.60)),
+            traffic_light_stable_frames=max(1, int(data.get("traffic_light_stable_frames", 4))),
+            traffic_light_debug_overlay=bool(data.get("traffic_light_debug_overlay", True)),
             stop_line=polygon(data.get("stop_line")),
             bus_lane_enabled=bool(data.get("bus_lane_enabled", False)),
             bus_lane_polygon=polygon(data.get("bus_lane_polygon")),
@@ -111,7 +157,7 @@ class CameraRuleConfig:
             entry_zone=polygon(data.get("entry_zone")),
             exit_zones={str(key): polygon(value) for key, value in (data.get("exit_zones") or {}).items()},
             restricted_exit_zones=[str(item) for item in data.get("restricted_exit_zones", [])],
-            citation_amounts={str(key): float(value) for key, value in (data.get("citation_amounts") or {}).items()},
+            citation_amounts=citation_amounts,
             evidence_video_enabled=bool(data.get("evidence_video_enabled", False)),
             evidence_video_seconds=float(data.get("evidence_video_seconds", 3.0)),
         )
@@ -144,8 +190,18 @@ class TrafficStore:
                 camera_id TEXT NOT NULL, timestamp TEXT NOT NULL, detection_confidence REAL,
                 ocr_confidence REAL, estimated_speed REAL, speed_limit REAL, excess_speed REAL,
                 traffic_light_state TEXT, zone_name TEXT, evidence_image TEXT, evidence_video TEXT,
+                plate_image TEXT, fine_amount REAL, violation_date TEXT, violation_time TEXT,
                 description TEXT, citation_id INTEGER, event_key TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL)""")
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(traffic_violations)")}
+            for column_name, column_type in {
+                "plate_image": "TEXT",
+                "fine_amount": "REAL",
+                "violation_date": "TEXT",
+                "violation_time": "TEXT",
+            }.items():
+                if column_name not in columns:
+                    connection.execute(f"ALTER TABLE traffic_violations ADD COLUMN {column_name} {column_type}")
             connection.execute("""CREATE TABLE IF NOT EXISTS citations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, citation_number TEXT NOT NULL UNIQUE, violation_id INTEGER NOT NULL,
                 plate_text TEXT, violation_type TEXT NOT NULL, citation_status TEXT NOT NULL,
@@ -195,11 +251,15 @@ class TrafficStore:
     def create_violation(self, candidate: dict[str, Any], config: CameraRuleConfig, frame: np.ndarray | None = None, video_frames: list[np.ndarray] | None = None) -> dict[str, Any] | None:
         event_key = str(candidate["event_key"])
         created = utc_now()
+        candidate_timestamp = str(candidate.get("timestamp") or created)
+        fine_amount = float(candidate.get("fine_amount") or config.citation_amounts.get(candidate.get("violation_type"), 50000.0) or 50000.0)
         evidence_image = None
+        plate_image_path = candidate.get("plate_image")
         if frame is not None and frame.size:
             self.evidence_path.mkdir(parents=True, exist_ok=True)
             evidence_image = str(self.evidence_path / f"{event_key}-{uuid.uuid4().hex[:8]}.jpg")
-            cv2.imwrite(evidence_image, frame)
+            annotated = self._annotate_evidence(frame, candidate, config)
+            cv2.imwrite(evidence_image, annotated)
         evidence_video = None
         if config.evidence_video_enabled and video_frames:
             self.evidence_path.mkdir(parents=True, exist_ok=True)
@@ -219,26 +279,48 @@ class TrafficStore:
             existing = connection.execute("SELECT * FROM traffic_violations WHERE event_key = ?", (event_key,)).fetchone()
             if existing:
                 return dict(existing)
+            violation_date = candidate_timestamp[:10] if candidate_timestamp else created[:10]
+            violation_time = candidate_timestamp[11:19] if len(candidate_timestamp) >= 19 and "T" in candidate_timestamp else created[11:19]
             cursor = connection.execute("""INSERT INTO traffic_violations
                 (plate_text,track_id,vehicle_make,vehicle_model,vehicle_type,violation_type,violation_status,camera_id,timestamp,
                 detection_confidence,ocr_confidence,estimated_speed,speed_limit,excess_speed,traffic_light_state,zone_name,
-                evidence_image,evidence_video,description,event_key,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
-                candidate.get("plate_text"), candidate.get("track_id"), candidate.get("vehicle_make"), candidate.get("vehicle_model"),
-                candidate.get("vehicle_type"), candidate["violation_type"], "PENDING_REVIEW", config.camera_id, candidate["timestamp"],
+                evidence_image,evidence_video,plate_image,fine_amount,violation_date,violation_time,description,event_key,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                candidate.get("plate_text") or "UNKNOWN", candidate.get("track_id"), candidate.get("vehicle_make"), candidate.get("vehicle_model"),
+                candidate.get("vehicle_type"), candidate["violation_type"], "PENDING_REVIEW", config.camera_id, candidate_timestamp,
                 candidate.get("detection_confidence"), candidate.get("ocr_confidence"), candidate.get("estimated_speed"),
                 candidate.get("speed_limit"), candidate.get("excess_speed"), candidate.get("traffic_light_state"),
-                candidate.get("zone_name"), evidence_image, evidence_video or candidate.get("evidence_video"), candidate.get("description"),
-                event_key, created, created))
+                candidate.get("zone_name"), evidence_image, evidence_video or candidate.get("evidence_video"), plate_image_path,
+                fine_amount, violation_date, violation_time, candidate.get("description"), event_key, created, created))
             violation_id = cursor.lastrowid
             citation_number = self._next_citation_number(connection)
             citation_cursor = connection.execute("""INSERT INTO citations
                 (citation_number,violation_id,plate_text,violation_type,citation_status,amount,issue_date,description,evidence_path,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (citation_number, violation_id, candidate.get("plate_text"), candidate["violation_type"],
-                "PENDING_REVIEW", config.citation_amounts.get(candidate["violation_type"]), candidate["timestamp"],
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (citation_number, violation_id, candidate.get("plate_text") or "UNKNOWN", candidate["violation_type"],
+                "PENDING_REVIEW", fine_amount, candidate_timestamp,
                 "System-generated / pending review. Application-configured amount; not a legal fine.", evidence_image, created, created))
             connection.execute("UPDATE traffic_violations SET citation_id = ? WHERE id = ?", (citation_cursor.lastrowid, violation_id))
         return self.get_violation(int(violation_id))
+
+    @staticmethod
+    def _annotate_evidence(frame: np.ndarray, candidate: dict[str, Any], config: CameraRuleConfig) -> np.ndarray:
+        annotated = frame.copy()
+        bbox = candidate.get("bbox")
+        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            x1, y1, x2, y2 = (int(round(value)) for value in bbox)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        text_lines = [
+            "RED LIGHT VIOLATION",
+            f"Plate: {candidate.get('plate_text') or 'UNKNOWN'}",
+            f"Track: {candidate.get('track_id', 'N/A')}",
+            f"Time: {candidate.get('timestamp') or utc_now()}",
+            f"Fine: ₦{float(candidate.get('fine_amount') or config.citation_amounts.get('RED_LIGHT', 50000.0)):,.0f}",
+        ]
+        for index, text in enumerate(text_lines):
+            y = 24 + index * 22
+            cv2.putText(annotated, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(annotated, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+        return annotated
 
     @staticmethod
     def _next_citation_number(connection: sqlite3.Connection) -> str:
@@ -399,14 +481,15 @@ class TrafficViolationMonitor:
         if len(state.points) < self.min_track_frames or detection_confidence < self.confidence_threshold:
             return []
         candidates: list[dict[str, Any]] = []
-        base = {"track_id": track_id, "plate_text": plate_text, "vehicle_type": vehicle_type, "vehicle_make": vehicle_make, "vehicle_model": vehicle_model, "detection_confidence": detection_confidence, "ocr_confidence": ocr_confidence, "timestamp": datetime.fromtimestamp(timestamp, timezone.utc).isoformat()}
-        if self.config.traffic_light_enabled and self.config.traffic_light_state == "RED" and len(self.config.stop_line) == 2 and len(state.points) >= 2:
+        base = {"track_id": track_id, "plate_text": plate_text, "vehicle_type": vehicle_type, "vehicle_make": vehicle_make, "vehicle_model": vehicle_model, "detection_confidence": detection_confidence, "ocr_confidence": ocr_confidence, "timestamp": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(), "bbox": bbox}
+        traffic_light_state = normalize_traffic_light_state(self.config.traffic_light_state)
+        if self.config.traffic_light_enabled and traffic_light_state == "RED" and len(self.config.stop_line) == 2 and len(state.points) >= 2:
             before, current = state.points[-2], state.points[-1]
             crossed = line_side((before[0], before[1]), self.config.stop_line) * line_side((current[0], current[1]), self.config.stop_line) <= 0
             moving = math.dist(before[:2], current[:2]) > 2.0
             if crossed and moving and not state.red_reported and self._eligible(track_id, "RED_LIGHT", timestamp):
                 state.red_reported = True
-                candidates.append({**base, "violation_type": "RED_LIGHT", "traffic_light_state": "RED", "zone_name": "stop_line", "description": "Vehicle crossed the configured stop line while the traffic light was red.", "event_key": f"{self.config.camera_id}:{track_id}:RED_LIGHT"})
+                candidates.append({**base, "violation_type": "RED_LIGHT", "traffic_light_state": "RED", "zone_name": "stop_line", "description": "Vehicle crossed the configured stop line while the traffic light was red.", "event_key": f"{self.config.camera_id}:{track_id}:RED_LIGHT", "fine_amount": self.config.citation_amounts.get("RED_LIGHT", 50000.0)})
         if self.config.bus_lane_enabled and str(vehicle_type or "").lower() not in self.config.allowed_vehicle_types:
             point_is_in_lane = point_in_polygon(point, self.config.bus_lane_polygon)
             if point_is_in_lane and state.lane_entered_at is not None and timestamp - state.lane_entered_at >= self.config.bus_lane_min_duration and not state.lane_reported and self._eligible(track_id, "BUS_LANE", timestamp):
