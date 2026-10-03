@@ -1,0 +1,30 @@
+[project]
+name = "nigerian-vnpr"
+version = "1.0.0"
+requires-python = "==3.12.*"
+dependencies = [
+    "torch==2.9.1+cpu",
+    "torchvision==0.24.1+cpu",
+    "fastapi[standard]>=0.115,<1",
+    "uvicorn[standard]>=0.30,<1",
+    "python-multipart>=0.0.9,<1",
+    "opencv-python-headless>=4.9,<5",
+    "numpy>=1.26,<3",
+    "ultralytics>=8.2,<9",
+    "easyocr>=1.7,<2",
+    "psutil>=5.8,<8",
+    "pytest>=8,<9",
+    "httpx>=0.27,<1",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
