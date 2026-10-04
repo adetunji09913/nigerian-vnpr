@@ -6,6 +6,7 @@ import cv2
 
 from .config import Settings, settings
 from .detector import YOLOPlateDetector
+from .diagnostics import log_phase
 from .normalization import compact_plate_text, is_ocr_quality_plate, normalize_plate_text, verify_plate_with_database
 from .ocr import OCRReader
 from .schemas import BoundingBox, PlateResult
@@ -57,7 +58,19 @@ class VNPRPipeline:
             return {"enabled": True, "success": False, "character_count": 0, "boxes": [], "character_crops": [], "debug": {"reason": "empty_plate_crop"}}
         try:
             debug_dir = Path("debug_segmentation") if debug else None
+            log_phase(
+                logger,
+                "character_segmentation_before",
+                width=int(plate_crop.shape[1]),
+                height=int(plate_crop.shape[0]),
+            )
             result = segment_plate_characters(plate_crop, debug=debug, debug_dir=debug_dir)
+            log_phase(
+                logger,
+                "character_segmentation_after",
+                width=int(plate_crop.shape[1]),
+                height=int(plate_crop.shape[0]),
+            )
             if not isinstance(result, dict):
                 return {"enabled": True, "success": False, "character_count": 0, "boxes": [], "character_crops": [], "debug": {"reason": "invalid_segmentation_result"}}
             result.setdefault("enabled", True)
@@ -70,11 +83,28 @@ class VNPRPipeline:
                 result["debug"].setdefault("reason", "segmentation_failed")
             return result
         except Exception as exc:
-            logger.warning("Character segmentation failed for plate crop: %s", exc, exc_info=True)
+            log_phase(
+                logger,
+                "character_segmentation_error",
+                width=int(plate_crop.shape[1]),
+                height=int(plate_crop.shape[0]),
+            )
             return {"enabled": True, "success": False, "character_count": 0, "boxes": [], "character_crops": [], "debug": {"reason": str(exc)}}
 
     def recognize(self, image: Any, debug: bool = False) -> list[PlateResult]:
+        log_phase(
+            logger,
+            "pipeline_recognize_before",
+            width=int(image.shape[1]) if image is not None else 0,
+            height=int(image.shape[0]) if image is not None else 0,
+        )
         results = []
+        log_phase(
+            logger,
+            "plate_detection_before",
+            width=int(image.shape[1]) if image is not None else 0,
+            height=int(image.shape[0]) if image is not None else 0,
+        )
         if hasattr(self.detector, "detect_robust") and self.config.detection_multiscale:
             try:
                 detections = self.detector.detect_robust(
@@ -92,40 +122,37 @@ class VNPRPipeline:
                 "detection_method": "yolo" if detections else None,
                 "detections": [self.detector._serialize_detection(item) for item in detections],
             }
+        log_phase(logger, "plate_detection_after", detection_count=len(detections))
         vehicle = None
         for detection in detections:
             debug_payload = None
-            image_shape = image.shape if image is not None else None
-            color_format = "BGR" if image is not None and len(image.shape) == 3 else "GRAY"
-            print(
-                f"[OCR DEBUG] original image shape={image_shape}; color_format={color_format}; "
-                f"bbox={ [detection.x1, detection.y1, detection.x2, detection.y2] }",
-                flush=True,
+            log_phase(
+                logger,
+                "plate_crop_before",
+                width=max(0, detection.x2 - detection.x1),
+                height=max(0, detection.y2 - detection.y1),
             )
             crop = image[detection.y1:detection.y2, detection.x1:detection.x2]
-            crop_is_none = crop is None
-            crop_is_empty = crop is not None and crop.size == 0
-            print(
-                f"[OCR DEBUG] crop is None={crop_is_none}; crop is empty={crop_is_empty}; "
-                f"crop shape={None if crop is None else crop.shape}; "
-                f"crop width={None if crop is None else crop.shape[1]}; crop height={None if crop is None else crop.shape[0]}; "
-                f"color_format={color_format}",
-                flush=True,
+            log_phase(
+                logger,
+                "plate_crop_after",
+                width=int(crop.shape[1]) if crop is not None else 0,
+                height=int(crop.shape[0]) if crop is not None else 0,
             )
             segmentation_result: dict[str, Any] = {"enabled": True, "success": False, "character_count": 0, "boxes": [], "character_crops": [], "debug": {}}
+            log_phase(
+                logger,
+                "ocr_completion_before",
+                width=int(crop.shape[1]) if crop is not None else 0,
+                height=int(crop.shape[0]) if crop is not None else 0,
+            )
             if crop is None or crop.size == 0:
-                logger.warning("Plate crop is empty: width=0 height=0 bbox=%s", [detection.x1, detection.y1, detection.x2, detection.y2])
                 text, ocr_confidence = "", 0.0
             else:
-                crop_width, crop_height = crop.shape[1], crop.shape[0]
-                logger.info("Plate crop: width=%s height=%s shape=%s bbox=%s", crop_width, crop_height, crop.shape, [detection.x1, detection.y1, detection.x2, detection.y2])
                 debug_crop_path = Path("debug_plate_crop.jpg")
-                saved = cv2.imwrite(str(debug_crop_path), crop)
-                print(
-                    f"[OCR DEBUG] saved crop to {debug_crop_path} -> {saved}; "
-                    f"crop shape={crop.shape}; crop width={crop_width}; crop height={crop_height}",
-                    flush=True,
-                )
+                log_phase(logger, "plate_crop_write_before", width=int(crop.shape[1]), height=int(crop.shape[0]))
+                cv2.imwrite(str(debug_crop_path), crop)
+                log_phase(logger, "plate_crop_write_after", width=int(crop.shape[1]), height=int(crop.shape[0]))
                 segmentation_result = self._run_character_segmentation(crop, debug=debug)
                 char_texts: list[str] = []
                 if segmentation_result.get("success"):
@@ -146,8 +173,13 @@ class VNPRPipeline:
                         else:
                             text, ocr_confidence = self.ocr.read(crop)
                             segmentation_result["used_for_ocr"] = False
-                    except Exception as exc:
-                        logger.warning("Character-level OCR failed, falling back to full crop OCR: %s", exc, exc_info=True)
+                    except Exception:
+                        log_phase(
+                            logger,
+                            "character_ocr_fallback",
+                            width=int(crop.shape[1]),
+                            height=int(crop.shape[0]),
+                        )
                         text, ocr_confidence = self.ocr.read(crop)
                         segmentation_result["used_for_ocr"] = False
                 else:
@@ -160,13 +192,12 @@ class VNPRPipeline:
                 debug_payload["character_segmentation"] = debug_segmentation
                 if debug:
                     debug_payload["detection"] = self.last_detection_diagnostics
-                normalized_ocr = normalize_plate_text(text)
-                logger.info("OCR raw result=%r normalized result=%r confidence=%s", text, normalized_ocr, ocr_confidence)
-                print(
-                    f"[OCR DEBUG] Raw OCR result: {text!r}; Raw OCR confidence: {ocr_confidence}; "
-                    f"Normalized OCR result: {normalized_ocr!r}",
-                    flush=True,
-                )
+            log_phase(
+                logger,
+                "ocr_completion_after",
+                width=int(crop.shape[1]) if crop is not None else 0,
+                height=int(crop.shape[0]) if crop is not None else 0,
+            )
 
             ocr_debug = debug_payload if isinstance(debug_payload, dict) else {}
             raw_ocr_text = normalize_plate_text(ocr_debug.get("raw_ocr_text", text))
@@ -179,7 +210,9 @@ class VNPRPipeline:
             correction_reason = ocr_debug.get("correction_reason")
 
             if self.plate_registry and compact_text:
+                log_phase(logger, "registry_verification_before")
                 corrected_text, correction_applied, correction_reason = verify_plate_with_database(normalized_text, self.plate_registry.lookup)
+                log_phase(logger, "registry_verification_after")
                 if corrected_text and corrected_text != normalized_text:
                     normalized_text = corrected_text
                     ocr_succeeded = is_ocr_quality_plate(corrected_text)
@@ -207,14 +240,28 @@ class VNPRPipeline:
             })
 
             if compact_text and vehicle is None:
+                log_phase(
+                    logger,
+                    "vehicle_classifier_before",
+                    width=int(image.shape[1]),
+                    height=int(image.shape[0]),
+                )
                 vehicle = self.vehicle_classifier.classify(image)
+                log_phase(
+                    logger,
+                    "vehicle_classifier_after",
+                    width=int(image.shape[1]),
+                    height=int(image.shape[0]),
+                )
 
-            is_registered, is_verified = (
-                self.plate_registry.lookup(normalized_text)
-                if self.plate_registry and normalized_text != "UNKNOWN" and ocr_succeeded
-                else (False, False)
-            )
+            if self.plate_registry and normalized_text != "UNKNOWN" and ocr_succeeded:
+                log_phase(logger, "registry_lookup_before")
+                is_registered, is_verified = self.plate_registry.lookup(normalized_text)
+                log_phase(logger, "registry_lookup_after")
+            else:
+                is_registered, is_verified = False, False
 
+            log_phase(logger, "plate_result_construction_before")
             results.append(PlateResult(
                 normalized_text,
                 detection.confidence,
@@ -228,10 +275,6 @@ class VNPRPipeline:
                 debug=debug_payload,
                 detection_method=detection.method,
             ))
-        logger.info("Pipeline: YOLO detections=%s OCR results=%s", len(detections), sum(result.text != "UNKNOWN" for result in results))
-        print(
-            f"[OCR DEBUG] Final OCR results: {sum(result.text != 'UNKNOWN' for result in results)}; "
-            f"Pipeline results: {len(results)}",
-            flush=True,
-        )
+            log_phase(logger, "plate_result_construction_after")
+        log_phase(logger, "pipeline_recognize_after", result_count=len(results))
         return results

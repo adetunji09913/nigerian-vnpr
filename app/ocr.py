@@ -75,13 +75,6 @@ class OCRReader:
             )
             log_phase(logger, "after_easyocr_load")
 
-            print(
-                f"[OCR TEST] OCR initialized = YES; "
-                f"languages={self.languages}; "
-                f"gpu={self.gpu}",
-                flush=True
-            )
-
         return self._reader
 
 
@@ -485,6 +478,13 @@ class OCRReader:
 
         try:
 
+            log_phase(
+                logger,
+                "ocr_readtext_before",
+                variant=variant_name,
+                width=int(image.shape[1]),
+                height=int(image.shape[0]),
+            )
             entries = reader.readtext(
                 image,
                 detail=1,
@@ -500,21 +500,23 @@ class OCRReader:
                 canvas_size=2560,
                 decoder="greedy",
             )
-
-        except Exception as exc:
-
-            print(
-                f"[OCR ERROR] {exc!r}",
-                flush=True
+            log_phase(
+                logger,
+                "ocr_readtext_after",
+                variant=variant_name,
+                width=int(image.shape[1]),
+                height=int(image.shape[0]),
             )
 
+        except Exception as exc:
+            log_phase(
+                logger,
+                "ocr_readtext_error",
+                variant=variant_name,
+                width=int(image.shape[1]),
+                height=int(image.shape[0]),
+            )
             raise
-
-        print(
-            f"[OCR TEST] raw EasyOCR output = "
-            f"{entries!r}",
-            flush=True
-        )
 
         if not entries:
 
@@ -614,19 +616,6 @@ class OCRReader:
                 )
             )
 
-            print(
-                f"[OCR PLATE] Whole plate: "
-                f"{raw_text}",
-                flush=True
-            )
-
-            print(
-                f"[OCR PLATE] Corrected: "
-                f"{raw_text} -> "
-                f"{corrected_text}",
-                flush=True
-            )
-
             return {
                 "text": corrected_text,
                 "confidence": best["confidence"],
@@ -692,13 +681,6 @@ class OCRReader:
         )
 
 
-        print(
-            f"[OCR COMBINE] Characters detected: "
-            f"{combined_text}",
-            flush=True
-        )
-
-
         # =====================================================
         # CORRECT OCR CHARACTER CONFUSIONS
         # =====================================================
@@ -707,14 +689,6 @@ class OCRReader:
             correct_positional_plate(
                 combined_text
             )
-        )
-
-
-        print(
-            f"[OCR COMBINE] Corrected plate: "
-            f"{combined_text} -> "
-            f"{corrected_text}",
-            flush=True
         )
 
 
@@ -880,8 +854,20 @@ class OCRReader:
         image: Any
     ) -> list[dict[str, Any]]:
 
+        log_phase(
+            logger,
+            "ocr_preprocess_before",
+            width=int(image.shape[1]) if image is not None and image.size else 0,
+            height=int(image.shape[0]) if image is not None and image.size else 0,
+        )
         pipeline = self.preprocess_plate(
             image
+        )
+        log_phase(
+            logger,
+            "ocr_preprocess_after",
+            width=int(image.shape[1]) if image is not None and image.size else 0,
+            height=int(image.shape[0]) if image is not None and image.size else 0,
         )
 
         variants = pipeline.get(
@@ -902,20 +888,6 @@ class OCRReader:
                 reader,
                 variant_name,
                 variant_image
-            )
-
-            label = (
-                "ORIGINAL CROP OCR"
-                if variant_name == "original_rgb"
-                else "ENHANCED CROP OCR"
-            )
-
-            print(
-                f"{label}: "
-                f"text={result.get('text', '')!r}; "
-                f"confidence="
-                f"{result.get('confidence', 0.0)}",
-                flush=True
             )
 
             if result.get("text"):
@@ -1133,10 +1105,22 @@ class OCRReader:
         crop: Any
     ) -> tuple[str, float]:
 
+        log_phase(
+            logger,
+            "ocr_read_before",
+            width=int(crop.shape[1]) if crop is not None and crop.size else 0,
+            height=int(crop.shape[0]) if crop is not None and crop.size else 0,
+        )
         selected_text, selected_confidence, debug_payload = (
             self._read_with_variants(
                 crop
             )
+        )
+        log_phase(
+            logger,
+            "ocr_read_after",
+            width=int(crop.shape[1]) if crop is not None and crop.size else 0,
+            height=int(crop.shape[0]) if crop is not None and crop.size else 0,
         )
 
         self.last_debug = debug_payload

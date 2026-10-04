@@ -75,11 +75,15 @@ app = FastAPI(title="Nigerian VNPR API", version="1.0.0", lifespan=lifespan)
 
 def _status_payload(plate_text: str | None) -> dict[str, object]:
     plate = normalize_plate_text(str(plate_text or "")) if plate_text else ""
+    log_phase(logger, "status_construction_before")
     if not plate:
-        return {"plate_text": "", "status": "clear", "reason": None, "amount_owed": 0.0, "outstanding_amount": 0.0, "is_flagged": False}
+        payload = {"plate_text": "", "status": "clear", "reason": None, "amount_owed": 0.0, "outstanding_amount": 0.0, "is_flagged": False}
+        log_phase(logger, "status_construction_after")
+        return payload
     data = vehicle_status.lookup(plate)
     data["amount_owed"] = float(data.get("amount_owed", 0.0) or 0.0)
     data["outstanding_amount"] = float(data.get("outstanding_amount", 0.0) or 0.0)
+    log_phase(logger, "status_construction_after")
     return data
 
 
@@ -540,7 +544,8 @@ def _encode_image(image: np.ndarray, fmt: str = ".png") -> str:
 
 def _persist_upload_results(results: list, image_path: str | None = None) -> dict[str, dict[str, object]]:
     registrations: dict[str, dict[str, object]] = {}
-    for result in results:
+    for result_index, result in enumerate(results):
+        log_phase(logger, "vehicle_persistence_record_before", result_index=result_index)
         registration = persistent_vehicles.record_recognition(
             result.text,
             result.make,
@@ -551,6 +556,7 @@ def _persist_upload_results(results: list, image_path: str | None = None) -> dic
             vehicle_confidence=result.vehicle_confidence,
             ocr_threshold=settings.traffic_ocr_threshold,
         )
+        log_phase(logger, "vehicle_persistence_record_after", result_index=result_index)
         if registration:
             registrations[normalize_plate_text(result.text)] = registration
     return registrations
@@ -587,15 +593,22 @@ async def recognize(request: Request, file: UploadFile = File(...), debug: bool 
             coordinate_scale = 1.0 / scale
             resized_dimensions = (max(1, round(width * scale)), max(1, round(height * scale)))
             image = cv2.resize(image, resized_dimensions, interpolation=cv2.INTER_AREA)
+        log_phase(logger, "recognition_pipeline_before", width=int(image.shape[1]), height=int(image.shape[0]))
         results = await run_in_threadpool(pipeline.recognize, image, debug=debug)
+        log_phase(logger, "recognition_pipeline_after", result_count=len(results))
         valid_results = [
             result
             for result in results
             if is_plausible_nigerian_plate(result.text)
             and result.ocr_confidence >= settings.traffic_ocr_threshold
         ]
+        log_phase(logger, "history_save_before", result_count=len(valid_results))
         history.save_results(valid_results)
+        log_phase(logger, "history_save_after", result_count=len(valid_results))
+        log_phase(logger, "vehicle_persistence_before", result_count=len(results))
         registrations = _persist_upload_results(results, file.filename)
+        log_phase(logger, "vehicle_persistence_after", registration_count=len(registrations))
+        log_phase(logger, "recognition_response_construction_before", result_count=len(results))
         response: dict[str, object] = {
             "count": len(results),
             "results": [
@@ -645,6 +658,7 @@ async def recognize(request: Request, file: UploadFile = File(...), debug: bool 
                 "bbox": results[0].bbox.to_dict() if results else None,
                 "detection": pipeline.last_detection_diagnostics,
             }
+        log_phase(logger, "recognition_response_construction_after", result_count=len(results))
         log_phase(logger, "recognition_complete")
         return response
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
